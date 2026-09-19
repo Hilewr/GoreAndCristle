@@ -83,8 +83,19 @@ CHANNEL_DATA = {"id": int(_env_channel) if _env_channel.lstrip("-").isdigit() el
 PRIVATE_CHANNELS = (parse_ids(os.getenv("PRIVATE_CHANNEL_IDS")) or list(_stored.get("private_channels", [])))[:PRIVATE_LIMIT]
 
 # Автопосты: пул видео из привата, счётчик номера, дата последнего поста
-AUTOPOST = {"enabled": True, "source_id": None, "counter": 0, "last_date": None, "pool": [], "used": []}
+AUTOPOST = {
+    "enabled": True, "source_id": None, "counter": 0,
+    "per_day": None,      # сколько постов в день; None = значение по умолчанию (переменная AUTOPOST_PER_DAY, иначе 1)
+    "start_date": None,   # с какого дня работает расписание (при первом запуске это завтра)
+    "last_date": None,    # день последнего поста
+    "day_date": None, "day_count": 0,  # сколько постов уже вышло в день day_date
+    "pool": [], "used": [],
+}
 AUTOPOST.update(_stored.get("autopost", {}))
+if AUTOPOST["start_date"] is None and AUTOPOST["last_date"]:
+    # данные из прошлой версии: расписание уже работало, пост в last_date уже вышел
+    AUTOPOST["start_date"] = AUTOPOST["last_date"]
+    AUTOPOST["day_date"], AUTOPOST["day_count"] = AUTOPOST["last_date"], 1
 _env_source = os.getenv("AUTOPOST_SOURCE_ID", "")
 if _env_source.lstrip("-").isdigit():
     AUTOPOST["source_id"] = int(_env_source)
@@ -454,6 +465,11 @@ def _parse_window(raw):
 
 
 AUTOPOST_WINDOW = _parse_window(os.getenv("AUTOPOST_WINDOW"))  # часы, в которые может выйти пост, например "11-21"
+MAX_PER_DAY = 20
+try:
+    DEFAULT_PER_DAY = min(MAX_PER_DAY, max(1, int(os.getenv("AUTOPOST_PER_DAY", "1"))))  # значение по умолчанию
+except ValueError:
+    DEFAULT_PER_DAY = 1
 AUTOPOST_LOCK = asyncio.Lock()  # чтобы ручной запуск и расписание не пересеклись
 IMPORT_STATS = {"added": 0, "dups": 0}
 _SCHED = {"fail_date": None, "fails": 0, "next_retry": 0.0}
@@ -463,11 +479,37 @@ def autopost_now():
     return datetime.now(AUTOPOST_TZ)
 
 
-def planned_time(day):
-    """Случайное время автопоста на указанный день. Оно одинаково при перезапусках бота."""
+def posts_per_day():
+    return AUTOPOST.get("per_day") or DEFAULT_PER_DAY
+
+
+def planned_times(day, n):
+    """Время n автопостов на указанный день. Окно делится на n равных частей, в каждой берётся случайная минута,
+    так что посты разнесены по дню. Времена одинаковы при перезапусках бота."""
     start_h, end_h = AUTOPOST_WINDOW
-    minute = random.Random(f"autopost-{day.isoformat()}").randrange(start_h * 60, end_h * 60)
-    return datetime(day.year, day.month, day.day, minute // 60, minute % 60, tzinfo=AUTOPOST_TZ)
+    seg = max(1, (end_h - start_h) * 60 // n)
+    rng = random.Random(f"autopost-{day.isoformat()}-{n}")
+    minutes = [start_h * 60 + i * seg + rng.randrange(seg) for i in range(n)]
+    return [datetime(day.year, day.month, day.day, m // 60, m % 60, tzinfo=AUTOPOST_TZ) for m in minutes]
+
+
+def done_today(today_iso):
+    return AUTOPOST["day_count"] if AUTOPOST["day_date"] == today_iso else 0
+
+
+def schedule_text(today):
+    per_day = posts_per_day()
+    start = AUTOPOST["start_date"]
+    if start is None or today.isoformat() < start:
+        first_day = datetime.fromisoformat(start).date() if start else today + timedelta(days=1)
+        first = planned_times(first_day, per_day)[0]
+        return f"расписание стартует {first:%d.%m в %H:%M}"
+    done = done_today(today.isoformat())
+    if done >= per_day:
+        nxt = planned_times(today + timedelta(days=1), per_day)[0]
+        return f"на сегодня всё (вышло {done} из {per_day}), следующий {nxt:%d.%m в %H:%M}"
+    slots = planned_times(today, per_day)
+    return "сегодня по расписанию " + ", ".join(f"{t:%H:%M}" for t in slots) + f" (уже вышло: {done})"
 
 
 def add_to_pool(video):
@@ -540,7 +582,11 @@ async def publish_autopost():
 
             AUTOPOST["counter"] = number
             AUTOPOST["used"].append(item["uid"])
-            AUTOPOST["last_date"] = autopost_now().date().isoformat()
+            today = autopost_now().date().isoformat()
+            if AUTOPOST["day_date"] != today:
+                AUTOPOST["day_date"], AUTOPOST["day_count"] = today, 0
+            AUTOPOST["day_count"] += 1
+            AUTOPOST["last_date"] = today
             save_state()
 
             info = f"✅ Опубликовано: «Приват контент #{number}»."
@@ -558,23 +604,28 @@ async def autopost_tick():
     now = autopost_now()
     today = now.date().isoformat()
 
-    if AUTOPOST["last_date"] is None:
+    if AUTOPOST["start_date"] is None:
         # Самый первый запуск: чтобы бот не выложил пост «с порога», расписание стартует с завтрашнего дня.
-        AUTOPOST["last_date"] = today
+        AUTOPOST["start_date"] = (now.date() + timedelta(days=1)).isoformat()
         save_state()
         return
-    if not AUTOPOST["enabled"] or AUTOPOST["last_date"] == today:
+    if today < AUTOPOST["start_date"] or not AUTOPOST["enabled"]:
+        return
+
+    due = sum(1 for t in planned_times(now.date(), posts_per_day()) if t <= now)  # сколько слотов уже наступило
+    if done_today(today) >= due:
         return
     if not AUTOPOST["pool"] or not get_channel_id():
         return  # ещё не настроено, ждём молча
-    if now < planned_time(now.date()):
-        return
     if _SCHED["fail_date"] == today and (_SCHED["fails"] >= 3 or time.time() < _SCHED["next_retry"]):
         return
 
     ok, info = await publish_autopost()
     if ok:
         _SCHED["fails"] = 0
+        # слоты, пропущенные из-за простоя бота, не наверстываем пачкой постов
+        AUTOPOST["day_count"] = max(AUTOPOST["day_count"], due)
+        save_state()
         return
     if _SCHED["fail_date"] != today:
         _SCHED["fail_date"], _SCHED["fails"] = today, 0
@@ -624,19 +675,32 @@ async def autopost_cmd(message: types.Message, command: CommandObject, state: FS
         pool = AUTOPOST["pool"]
         used = set(AUTOPOST["used"])
         fresh = sum(1 for i in pool if i["uid"] not in used)
-        today = autopost_now().date()
-        posted_today = AUTOPOST["last_date"] in (None, today.isoformat())
-        next_dt = planned_time(today + timedelta(days=1) if posted_today else today)
         source = AUTOPOST["source_id"] or "не задан (напиши /autopost source в группе-привате)"
         await message.answer(
             f"Автопост: {'включён' if AUTOPOST['enabled'] else 'выключен'}\n"
             f"Источник контента: {source}\n"
             f"Видео в пуле: {len(pool)} (ещё не выходили в этом круге: {fresh})\n"
+            f"Постов в день: {posts_per_day()} (изменить: /autopost perday N)\n"
+            f"Расписание ({AUTOPOST_TZ_NAME}, окно {AUTOPOST_WINDOW[0]}:00–{AUTOPOST_WINDOW[1]}:00): "
+            f"{schedule_text(autopost_now().date())}\n"
             f"Следующий номер: #{AUTOPOST['counter'] + 1}\n"
             f"Последний автопост: {AUTOPOST['last_date'] or 'ещё не было'}\n"
-            f"Ближайший по расписанию: {next_dt:%d.%m %H:%M} "
-            f"({AUTOPOST_TZ_NAME}, окно {AUTOPOST_WINDOW[0]}:00–{AUTOPOST_WINDOW[1]}:00)\n"
             f"Файл данных: {DATA_FILE}"
+        )
+
+    elif action in ("perday", "per_day"):
+        if len(parts) < 2 or not parts[1].isdigit() or not 1 <= int(parts[1]) <= MAX_PER_DAY:
+            await message.answer(
+                f"Сколько постов в день (от 1 до {MAX_PER_DAY})? Например: /autopost perday 3\n"
+                f"Сейчас: {posts_per_day()}."
+            )
+            return
+        AUTOPOST["per_day"] = int(parts[1])
+        save_state()
+        await message.answer(
+            f"✅ Теперь автопостов в день: {AUTOPOST['per_day']}. Они выходят в случайное время "
+            f"({AUTOPOST_TZ_NAME}, окно {AUTOPOST_WINDOW[0]}:00–{AUTOPOST_WINDOW[1]}:00), "
+            f"{schedule_text(autopost_now().date())}."
         )
 
     elif action in ("on", "off"):
@@ -687,6 +751,7 @@ async def autopost_cmd(message: types.Message, command: CommandObject, state: FS
             "Команды автопоста:\n"
             "/autopost: выложить пост прямо сейчас (проверка или если долго не было постов)\n"
             "/autopost status: состояние и расписание\n"
+            "/autopost perday N: сколько постов в день (от 1 до 20)\n"
             "/autopost on, /autopost off: включить или выключить расписание\n"
             "/autopost number N: следующий пост будет #N\n"
             "/autopost source: (в группе-привате) брать контент отсюда\n"
