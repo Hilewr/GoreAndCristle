@@ -1,3 +1,4 @@
 aiogram==3.13.1
 moviepy==1.0.3
 requests==2.32.3
+tzdata
