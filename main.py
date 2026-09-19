@@ -5,7 +5,7 @@ import random
 import string
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command, CommandObject, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import LabeledPrice, PreCheckoutQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -35,6 +35,7 @@ video_database = {}
 CHANNEL_DATA = {"id": None}  # Хранение ID канала без создания файлов
 
 PRIVATE_LIMIT = 2  # сколько приватов продаётся вместе
+BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # больше этого бот не может скачать через Bot API
 
 
 def parse_ids(raw):
@@ -160,6 +161,18 @@ def apply_watermark_image(input_path, output_path):
 # --- ПРИВЯЗКА ПРИВАТОВ: /private_links ---
 # Эти хендлеры должны стоять ВЫШЕ привязки основного канала: пока админ в режиме
 # привязки приватов, пересланный пост должен попасть сюда, а не в основной канал.
+async def private_binding_error(chat_id, title):
+    """Текст ошибки, если бот не сможет создавать в этом чате одноразовые ссылки, иначе None.
+    Проверяем сразу при привязке, а не после чьей-то оплаты."""
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+    except Exception as e:
+        return f"❌ Не удалось проверить права бота в «{title}»: {e}\nДобавь бота админом и попробуй ещё раз."
+    if member.status != "administrator" or not getattr(member, "can_invite_users", False):
+        return f"❌ В «{title}» бот не админ или у него нет права «Приглашать пользователей». Выдай право и попробуй ещё раз."
+    return None
+
+
 @dp.message(Command("private_links"))
 async def start_private_binding(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
@@ -173,7 +186,9 @@ async def start_private_binding(message: types.Message, state: FSMContext):
         f"{current}\n\n"
         f"Привязываем заново (максимум {PRIVATE_LIMIT}). Сначала добавь бота админом в каждый приват "
         "с правом «Приглашать пользователей», потом пересылай мне по одному посту из каждого привата.\n\n"
-        "Закончить раньше — /done, отменить — /cancel. "
+        "Если приват — группа с темами (постов для пересылки там нет), закончи здесь через /done, "
+        "а потом напиши /private_here прямо в этой группе: она добавится к уже привязанным.\n\n"
+        "Закончить — /done, отменить — /cancel. "
         "Старая привязка заменится, только когда закончишь."
     )
 
@@ -194,7 +209,7 @@ async def commit_private_channels(message: types.Message, state: FSMContext, ids
 async def bind_private_channel(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
     chat = message.forward_from_chat
-    if chat.type != "channel":
+    if chat.type not in ("channel", "supergroup"):
         await message.answer("Это не канал. Перешли пост из канала-привата:")
         return
 
@@ -204,14 +219,9 @@ async def bind_private_channel(message: types.Message, state: FSMContext):
         await message.answer("Этот приват уже добавлен. Перешли пост из другого или напиши /done.")
         return
 
-    # Проверяем права бота сразу, а не после чьей-то оплаты
-    try:
-        member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
-    except Exception as e:
-        await message.answer(f"❌ Не удалось проверить права бота в «{chat.title}»: {e}\nДобавь бота в канал админом и перешли пост ещё раз.")
-        return
-    if member.status != "administrator" or not getattr(member, "can_invite_users", False):
-        await message.answer(f"❌ В «{chat.title}» бот не админ или у него нет права «Приглашать пользователей». Выдай право и перешли пост ещё раз.")
+    error = await private_binding_error(chat.id, chat.title)
+    if error:
+        await message.answer(error + "\nПотом перешли пост ещё раз.")
         return
 
     ids.append(chat.id)
@@ -240,7 +250,10 @@ async def finish_private_binding(message: types.Message, state: FSMContext):
 
 @dp.message(PrivateStates.waiting_for_private_forward, lambda m: not (m.text or "").startswith("/"))
 async def private_binding_hint(message: types.Message):
-    await message.answer("Перешли мне пост из канала-привата (именно пересылкой) или напиши /done, /cancel.")
+    await message.answer(
+        "Перешли мне пост из канала-привата (именно пересылкой) или напиши /done, /cancel.\n"
+        "Группа с темами: закончи через /done и напиши /private_here прямо в ней."
+    )
 
 
 @dp.message(Command("cancel"))
@@ -250,14 +263,75 @@ async def cancel_any(message: types.Message, state: FSMContext):
     await message.answer("❌ Отменено.")
 
 
+# --- ПРИВЯЗКА ГРУППЫ-ПРИВАТА (в т.ч. с темами): /private_here ---
+# У группы с темами нет «постов», которые можно переслать, поэтому админ пишет команду
+# прямо в группе, а бот берёт ID из самого сообщения. Приват ДОБАВЛЯЕТСЯ к уже привязанным.
+GROUP_ANONYMOUS_BOT_ID = 1087968824  # так Telegram подписывает анонимных админов
+
+
+@dp.message(Command("private_here"))
+async def bind_private_here(message: types.Message):
+    user = message.from_user
+    chat = message.chat
+
+    if chat.type == "private":
+        if user and user.id in ADMIN_IDS:
+            await message.answer("Эту команду надо написать прямо в группе-привате, а не мне в личку.")
+        return
+    if user and user.id == GROUP_ANONYMOUS_BOT_ID:
+        await message.answer("Ты пишешь анонимно (от имени группы), и я не вижу, кто ты. Отключи анонимность у админа и повтори.")
+        return
+    if not user or user.id not in ADMIN_IDS:
+        return
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    if chat.id in PRIVATE_CHANNELS:
+        await message.answer("Этот приват уже привязан.")
+        return
+    if len(PRIVATE_CHANNELS) >= PRIVATE_LIMIT:
+        await message.answer(f"Уже привязано приватов: {PRIVATE_LIMIT}. Чтобы изменить, напиши мне в личку /private_links.")
+        return
+
+    error = await private_binding_error(chat.id, chat.title)
+    if error:
+        await message.answer(error)
+        return
+
+    PRIVATE_CHANNELS.append(chat.id)
+    ids_str = ",".join(str(i) for i in PRIVATE_CHANNELS)
+    await message.answer(
+        f"✅ Приват «{chat.title}» привязан ({len(PRIVATE_CHANNELS)}/{PRIVATE_LIMIT}).\n\n"
+        "Чтобы привязка переживала перезапуск бота, задай на хостинге переменную окружения:\n"
+        f"PRIVATE_CHANNEL_IDS={ids_str}"
+    )
+
+
 # --- ПРИВЯЗКА КАНАЛА ---
-@dp.message(F.forward_from_chat)
+# Работает только когда админ НЕ в процессе создания поста (StateFilter(None)):
+# внутри /post пересланные видео и картинки из других каналов — это материал для поста,
+# а не привязка. Плюс канал привязывается, только если бот там админ с правом публикации,
+# поэтому случайная пересылка из чужого канала ничего не перепривяжет.
+@dp.message(StateFilter(None), F.forward_from_chat)
 async def handle_forwarded_channel(message: types.Message):
     if message.from_user.id not in ADMIN_IDS: return
-    if message.forward_from_chat.type == "channel":
-        channel_id = message.forward_from_chat.id
-        CHANNEL_DATA["id"] = channel_id
-        await message.answer(f"✅ Канал успешно привязан в память бота!\nID канала: `{channel_id}`\nТеперь можно создавать посты.")
+    chat = message.forward_from_chat
+    if chat.type != "channel": return
+
+    try:
+        member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
+        can_post = member.status == "administrator" and bool(getattr(member, "can_post_messages", False))
+    except Exception:
+        can_post = False
+    if not can_post:
+        await message.answer(
+            f"⚠️ Канал «{chat.title}» не привязан: бота там нет или у него нет права публиковать сообщения.\n"
+            "Если ты пересылаешь материал для поста, сначала напиши /post, а потом пересылай."
+        )
+        return
+
+    CHANNEL_DATA["id"] = chat.id
+    await message.answer(f"✅ Канал «{chat.title}» привязан для постов.\nID канала: {chat.id}\nТеперь можно создавать посты.")
 
 
 # --- СТАРТ И ВЫДАЧА ВИДЕО В ЛИЧКУ ---
@@ -355,24 +429,29 @@ async def start_post(message: types.Message, state: FSMContext):
 @dp.message(PostStates.waiting_for_video, F.video)
 async def process_video(message: types.Message, state: FSMContext):
     await state.update_data(file_id=message.video.file_id)
-    await message.answer("Видео получено. Теперь отправь картинку для поста (или напиши `нет`, если пост без картинки):")
+    text = "Видео получено."
+    size = message.video.file_size
+    if size and size > BOT_API_DOWNLOAD_LIMIT:
+        text += f"\nℹ️ Оно весит {size / 1024 / 1024:.0f} МБ (больше 20 МБ), поэтому уйдёт без вотермарки."
+    text += "\n\nТеперь отправь картинку для поста (или напиши «нет», если пост без картинки):"
+    await message.answer(text)
     await state.set_state(PostStates.waiting_for_photo)
 
 
 @dp.message(PostStates.waiting_for_photo, F.photo)
 async def process_photo(message: types.Message, state: FSMContext):
     await state.update_data(photo_file_id=message.photo[-1].file_id)
-    await message.answer("Картинка получена. Напиши имя автора / описание (например: `влад сопляков`):")
+    await message.answer("Картинка получена. Напиши имя автора / описание (например: «влад сопляков»):")
     await state.set_state(PostStates.waiting_for_title)
 
 
 @dp.message(PostStates.waiting_for_photo, F.text)
 async def process_photo_skip(message: types.Message, state: FSMContext):
     if message.text.strip().lower() != "нет":
-        await message.answer("Отправь картинку или напиши `нет`:")
+        await message.answer("Отправь картинку или напиши «нет»:")
         return
     await state.update_data(photo_file_id=None)
-    await message.answer("Ок, без картинки. Напиши имя автора / описание (например: `влад сопляков`):")
+    await message.answer("Ок, без картинки. Напиши имя автора / описание (например: «влад сопляков»):")
     await state.set_state(PostStates.waiting_for_title)
 
 
@@ -382,14 +461,14 @@ async def process_title(message: types.Message, state: FSMContext):
         await message.answer("Нужен текст. Напиши имя автора / описание:")
         return
     await state.update_data(title=message.text)
-    await message.answer("Укажи ссылку на полное видео (если ссылок нет, напиши `нет`):")
+    await message.answer("Укажи ссылку на полное видео (если ссылок нет, напиши «нет»):")
     await state.set_state(PostStates.waiting_for_link)
 
 
 @dp.message(PostStates.waiting_for_link)
 async def process_link(message: types.Message, state: FSMContext):
     if not message.text:
-        await message.answer("Нужен текст. Отправь ссылку или напиши `нет`:")
+        await message.answer("Нужен текст. Отправь ссылку или напиши «нет»:")
         return
 
     data = await state.get_data()
@@ -406,20 +485,35 @@ async def process_link(message: types.Message, state: FSMContext):
     input_photo_path = f"input_{user_id}.jpg"
     output_photo_path = f"output_{user_id}.jpg"
     new_photo_id = None
+    warnings = []
 
     try:
-        file = await bot.get_file(file_id)
-        await bot.download_file(file.file_path, input_video_path)
+        video_file = None
+        try:
+            video_file = await bot.get_file(file_id)
+        except TelegramBadRequest as e:
+            if "too big" not in str(e).lower():
+                raise
 
-        # moviepy работает синхронно и долго, поэтому гоняем в отдельном потоке,
-        # чтобы бот не «замерзал» для остальных пользователей
-        success = await asyncio.to_thread(apply_watermark, input_video_path, output_video_path)
-        final_video_path = output_video_path if success else input_video_path
+        if video_file is None:
+            # Больше 20 МБ: скачать нельзя, значит вотермарку не наложить.
+            # Отдаём видео по оригинальному file_id (по file_id отправка работает при любом размере).
+            new_file_id = file_id
+            warnings.append("ℹ️ Видео больше 20 МБ: оно уйдёт без вотермарки.")
+        else:
+            await bot.download_file(video_file.file_path, input_video_path)
 
-        # Загружаем видео в Telegram и вытаскиваем нормальный file_id из облака
-        temp_msg = await bot.send_video(chat_id=user_id, video=types.FSInputFile(final_video_path))
-        new_file_id = temp_msg.video.file_id
-        await bot.delete_message(chat_id=user_id, message_id=temp_msg.message_id)
+            # moviepy работает синхронно и долго, поэтому гоняем в отдельном потоке,
+            # чтобы бот не «замерзал» для остальных пользователей
+            success = await asyncio.to_thread(apply_watermark, input_video_path, output_video_path)
+            final_video_path = output_video_path if success else input_video_path
+            if not success:
+                warnings.append("⚠️ Вотермарка на видео не наложилась (подробности в логах): оно уйдёт без неё.")
+
+            # Загружаем видео в Telegram и вытаскиваем нормальный file_id из облака
+            temp_msg = await bot.send_video(chat_id=user_id, video=types.FSInputFile(final_video_path))
+            new_file_id = temp_msg.video.file_id
+            await bot.delete_message(chat_id=user_id, message_id=temp_msg.message_id)
 
         # Картинка для поста: та же вотермарка + тот же приём с file_id
         if photo_file_id:
@@ -427,6 +521,8 @@ async def process_link(message: types.Message, state: FSMContext):
             await bot.download_file(photo_file.file_path, input_photo_path)
             photo_ok = await asyncio.to_thread(apply_watermark_image, input_photo_path, output_photo_path)
             final_photo_path = output_photo_path if photo_ok else input_photo_path
+            if not photo_ok:
+                warnings.append("⚠️ Вотермарка на картинке не наложилась (подробности в логах): она уйдёт без неё.")
 
             temp_photo = await bot.send_photo(chat_id=user_id, photo=types.FSInputFile(final_photo_path))
             new_photo_id = temp_photo.photo[-1].file_id
@@ -476,7 +572,10 @@ async def process_link(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="🚀 Опубликовать", callback_data="publish_post")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_post")]
     ])
-    await message.answer("👀 Выше предпросмотр поста. Публикуем в канал?", reply_markup=confirm_kb)
+    confirm_text = "👀 Выше предпросмотр поста. Публикуем в канал?"
+    if warnings:
+        confirm_text += "\n\n" + "\n".join(warnings)
+    await message.answer(confirm_text, reply_markup=confirm_kb)
     await state.set_state(PostStates.waiting_for_confirm)
 
 
