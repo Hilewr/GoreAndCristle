@@ -14,7 +14,7 @@ from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8053962845").split(",") if x.strip()]
 PRICE_STARS = int(os.getenv("PRICE_STARS", 150))
-PRICE_LINK = os.getenv("PRICE_LINK", "https://t.me")
+PRICE_LINK = os.getenv("PRICE_LINK", "https://t.me/hebesm")
 CONFIG_FILE = "config.txt"
 
 bot = Bot(token=BOT_TOKEN)
