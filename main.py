@@ -22,9 +22,14 @@ dp = Dispatcher()
 
 video_database = {}
 
+# Явно определяем рабочую папку бота на сервере, чтобы он точно видел файлы
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WATERMARK_PATH = os.path.join(BASE_DIR, "watermark.png")
+
 def get_channel_id():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f:
+    config_path = os.path.join(BASE_DIR, CONFIG_FILE)
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
             content = f.read().strip()
             if content: return int(content)
     return None
@@ -38,13 +43,13 @@ class PostStates(StatesGroup):
     waiting_for_link = State()
     waiting_for_confirm = State()
 
-def apply_watermark(input_path, output_path, watermark_path="watermark.png"):
-    if not os.path.exists(watermark_path):
-        print("⚠️ Файл watermark.png не найден.")
+def apply_watermark(input_path, output_path):
+    if not os.path.exists(WATERMARK_PATH):
+        print(f"⚠️ Критическая ошибка: Файл вотермарки не найден по пути: {WATERMARK_PATH}")
         return False
     try:
         video = VideoFileClip(input_path)
-        watermark = (ImageClip(watermark_path)
+        watermark = (ImageClip(WATERMARK_PATH)
                      .resize(width=video.w * 0.2)
                      .set_opacity(0.6)
                      .set_duration(video.duration)
@@ -58,7 +63,19 @@ def apply_watermark(input_path, output_path, watermark_path="watermark.png"):
         print(f"Ошибка вотермарки: {e}")
         return False
 
+# Измененная функция: если не удалось скачать, или для надежности — юзаем watermark.png как обложку
 def download_random_image(output_path="random_preview.jpg"):
+    # Перестраховываемся на 100%: просто копируем твой логотип watermark.png как превью поста
+    # Это решает проблему с падением серверов Telegram из-за битых картинок из сети
+    if os.path.exists(WATERMARK_PATH):
+        try:
+            import shutil
+            shutil.copy(WATERMARK_PATH, output_path)
+            return True
+        except Exception as e:
+            print(f"Ошибка копирования вотермарки для превью: {e}")
+            
+    # Резервный вариант из интернета, если первого файла вдруг нет
     try:
         url = "https://picsum.photos"
         response = requests.get(url, timeout=10)
@@ -74,8 +91,10 @@ async def handle_forwarded_channel(message: types.Message):
     if message.from_user.id not in ADMIN_IDS: return
     if message.forward_from_chat.type == "channel":
         channel_id = message.forward_from_chat.id
-        with open(CONFIG_FILE, "w") as f: f.write(str(channel_id))
+        config_path = os.path.join(BASE_DIR, CONFIG_FILE)
+        with open(config_path, "w") as f: f.write(str(channel_id))
         await message.answer(f"✅ Канал привязан! ID: `{channel_id}`")
+
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, command: CommandObject):
     args = command.args
