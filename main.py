@@ -3,6 +3,7 @@ import asyncio
 import random
 import string
 import requests
+import shutil
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -10,29 +11,24 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import LabeledPrice, PreCheckoutQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from moviepy.editor import VideoFileClip, ImageClip, CompositeVideoClip
 
-# --- НАСТРОЙКИ (ИЗ ПАНЕЛИ ХОСТИНГА) ---
+# --- НАСТРОЙКИ (ВШИТЫ НАПРЯМУЮ) ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "8053962845").split(",") if x.strip()]
-PRICE_STARS = int(os.getenv("PRICE_STARS", 150))
-PRICE_LINK = os.getenv("PRICE_LINK", "https://t.me/hebesm")
-CONFIG_FILE = "config.txt"
+ADMIN_IDS = [8053962845]  # Твой админский ID
+PRICE_STARS = 150        # Цена в Звездах (150 Stars)
+PRICE_LINK = "https://t.me/hebesm"  # Твой Прайс/Директ
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Базы данных в оперативной памяти бота
 video_database = {}
+CHANNEL_DATA = {"id": None}  # Хранение ID канала без создания файлов
 
-# Явно определяем рабочую папку бота на сервере, чтобы он точно видел файлы
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WATERMARK_PATH = os.path.join(BASE_DIR, "watermark.png")
 
 def get_channel_id():
-    config_path = os.path.join(BASE_DIR, CONFIG_FILE)
-    if os.path.exists(config_path):
-        with open(config_path, "r") as f:
-            content = f.read().strip()
-            if content: return int(content)
-    return None
+    return CHANNEL_DATA["id"]
 
 def generate_random_slug(length=8):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
@@ -43,9 +39,10 @@ class PostStates(StatesGroup):
     waiting_for_link = State()
     waiting_for_confirm = State()
 
+# --- НАЛОЖЕНИЕ ВОТЕРМАРКИ ---
 def apply_watermark(input_path, output_path):
     if not os.path.exists(WATERMARK_PATH):
-        print(f"⚠️ Критическая ошибка: Файл вотермарки не найден по пути: {WATERMARK_PATH}")
+        print(f"⚠️ Вотермарка не найдена по пути: {WATERMARK_PATH}")
         return False
     try:
         video = VideoFileClip(input_path)
@@ -63,19 +60,15 @@ def apply_watermark(input_path, output_path):
         print(f"Ошибка вотермарки: {e}")
         return False
 
-# Измененная функция: если не удалось скачать, или для надежности — юзаем watermark.png как обложку
+# --- ПОДГОТОВКА ОБЛОЖКИ ПОСТА ---
 def download_random_image(output_path="random_preview.jpg"):
-    # Перестраховываемся на 100%: просто копируем твой логотип watermark.png как превью поста
-    # Это решает проблему с падением серверов Telegram из-за битых картинок из сети
     if os.path.exists(WATERMARK_PATH):
         try:
-            import shutil
             shutil.copy(WATERMARK_PATH, output_path)
             return True
         except Exception as e:
-            print(f"Ошибка копирования вотермарки для превью: {e}")
+            print(f"Ошибка копирования вотермарки: {e}")
             
-    # Резервный вариант из интернета, если первого файла вдруг нет
     try:
         url = "https://picsum.photos"
         response = requests.get(url, timeout=10)
@@ -86,15 +79,15 @@ def download_random_image(output_path="random_preview.jpg"):
         print(f"Ошибка скачивания фото: {e}")
     return False
 
+# --- ПРИВЯЗКА КАНАЛА ---
 @dp.message(F.forward_from_chat)
 async def handle_forwarded_channel(message: types.Message):
     if message.from_user.id not in ADMIN_IDS: return
     if message.forward_from_chat.type == "channel":
         channel_id = message.forward_from_chat.id
-        config_path = os.path.join(BASE_DIR, CONFIG_FILE)
-        with open(config_path, "w") as f: f.write(str(channel_id))
-        await message.answer(f"✅ Канал привязан! ID: `{channel_id}`")
-
+        CHANNEL_DATA["id"] = channel_id
+        await message.answer(f"✅ Канал успешно привязан в память бота!\nID канала: `{channel_id}`\nТеперь можно создавать посты.")
+# --- СТАРТ И ВЫДАЧА ВИДЕО В ЛИЧКУ ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, command: CommandObject):
     args = command.args
@@ -102,7 +95,7 @@ async def start_cmd(message: types.Message, command: CommandObject):
         video_slug = args.replace("vid_", "")
         if video_slug in video_database:
             saved_file_id = video_database[video_slug]
-            await message.answer("🎬 Твое видео готово к просмотру:")
+            await message.answer("🎬 Твое video готово к просмотру:")
             await bot.send_video(chat_id=message.from_user.id, video=saved_file_id)
             return
         else:
@@ -113,8 +106,9 @@ async def start_cmd(message: types.Message, command: CommandObject):
         [InlineKeyboardButton(text="💳 Купить приват (навсегда)", callback_data="buy_private")],
         [InlineKeyboardButton(text="📬 Написать в DIRECT (Прайс)", url=PRICE_LINK)]
     ])
-    await message.answer("Привет! Через этого бота можно получить доступ в приват или запустить скрытые видео.", reply_markup=kb)
+    await message.answer("Привет! Через этого бота можно получить доступ в приват или посмотреть видео по кнопкам из канала.", reply_markup=kb)
 
+# --- ОПЛАТА СТАРСАМИ ---
 @dp.callback_query(F.data == "buy_private")
 async def send_invoice(callback: types.CallbackQuery):
     await bot.send_invoice(
@@ -136,14 +130,15 @@ async def pre_checkout(pre_checkout_query: PreCheckoutQuery):
 async def success_payment(message: types.Message):
     channel_id = get_channel_id()
     if not channel_id:
-        await message.answer("⚠️ Ошибка: Главный канал не привязан.")
+        await message.answer("⚠️ Ошибка: Главный канал не привязан админом.")
         return
     try:
         invite_link = await bot.create_chat_invite_link(chat_id=channel_id, member_limit=1)
-        await message.answer(f"🎉 Успешно! Твоя ссылка в приват:\n\n{invite_link.invite_link}")
+        await message.answer(f"🎉 Успешно! Твоя уникальная ссылка для входа в приват:\n\n{invite_link.invite_link}")
     except Exception as e:
         await message.answer(f"Ошибка создания ссылки: {e}")
 
+# --- АДМИНКА: СОЗДАНИЕ ПОСТА-СКРЫТКИ ---
 @dp.message(Command("post"))
 async def start_post(message: types.Message, state: FSMContext):
     if message.from_user.id not in ADMIN_IDS: return
@@ -205,7 +200,7 @@ async def process_link(message: types.Message, state: FSMContext):
     
     await bot.send_photo(
         chat_id=message.from_user.id, photo=types.FSInputFile(preview_img_path),
-        caption=f"👀 <b>ПРЕДПРОСМОТР:</b>\n\n{caption}", reply_markup=channel_kb, parse_mode="HTML"
+        caption=f"👀 <b>ПРЕДПРОСМОТР ПОСТА:</b>\n\n{caption}", reply_markup=channel_kb, parse_mode="HTML"
     )
     
     await state.update_data(caption=caption, video_slug=video_slug, preview_path=preview_img_path)
@@ -214,7 +209,7 @@ async def process_link(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="🚀 Опубликовать", callback_data="publish_post")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_post")]
     ])
-    await message.answer("Публикуем?", reply_markup=confirm_kb)
+    await message.answer("Публикуем эту заглушку в канал?", reply_markup=confirm_kb)
     await state.set_state(PostStates.waiting_for_confirm)
     
     if os.path.exists(input_video_path): os.remove(input_video_path)
@@ -235,9 +230,9 @@ async def publish_post(callback: types.CallbackQuery, state: FSMContext):
             chat_id=channel_id, photo=types.FSInputFile(data['preview_path']),
             caption=data['caption'], reply_markup=channel_kb, parse_mode="HTML"
         )
-        await callback.message.answer("🚀 Пост опубликован!")
+        await callback.message.answer("🚀 Пост-заглушка успешно отправлен в канал!")
     except Exception as e:
-        await callback.message.answer(f"❌ Ошибка: {e}")
+        await callback.message.answer(f"❌ Ошибка публикации: {e}")
         
     if os.path.exists(data['preview_path']): os.remove(data['preview_path'])
     await state.clear()
@@ -248,7 +243,7 @@ async def cancel_post(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if os.path.exists(data['preview_path']): os.remove(data['preview_path'])
     await state.clear()
-    await callback.message.answer("❌ Отменено.")
+    await callback.message.answer("❌ Публикация отменена.")
     await callback.answer()
 
 async def main():
