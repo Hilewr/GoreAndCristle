@@ -2,8 +2,6 @@ import os
 import asyncio
 import random
 import string
-import requests
-import shutil
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -30,8 +28,9 @@ WATERMARK_PATH = os.path.join(BASE_DIR, "watermark.png")
 def get_channel_id():
     return CHANNEL_DATA["id"]
 
-def generate_random_slug(length=8):
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+# ФИКС: Генерируем только маленькие латинские буквы и цифры (заглавные запрещены в параметре ?start=)
+def generate_random_slug(length=12):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
 class PostStates(StatesGroup):
     waiting_for_video = State()
@@ -53,7 +52,6 @@ def apply_watermark(input_path, output_path):
                      .set_position(("right", "bottom")))
         final_video = CompositeVideoClip([video, watermark])
         
-        # Оптимизированный ультра-быстрый рендеринг (для экономии CPU хостинга)
         final_video.write_videofile(
             output_path, 
             codec="libx264", 
@@ -69,25 +67,6 @@ def apply_watermark(input_path, output_path):
     except Exception as e:
         print(f"Ошибка вотермарки: {e}")
         return False
-
-# --- ПОДГОТОВКА ОБЛОЖКИ ПОСТА ---
-def download_random_image(output_path="random_preview.jpg"):
-    if os.path.exists(WATERMARK_PATH):
-        try:
-            shutil.copy(WATERMARK_PATH, output_path)
-            return True
-        except Exception as e:
-            print(f"Ошибка копирования вотермарки: {e}")
-            
-    try:
-        url = "https://picsum.photos"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            with open(output_path, "wb") as f: f.write(response.content)
-            return True
-    except Exception as e:
-        print(f"Ошибка скачивания фото: {e}")
-    return False
 
 # --- ПРИВЯЗКА КАНАЛА ---
 @dp.message(F.forward_from_chat)
@@ -177,11 +156,10 @@ async def process_link(message: types.Message, state: FSMContext):
     title = data['title']
     file_id = data['file_id']
     
-    await message.answer("⏳ Обрабатываю видео, накладываю вотермарку...")
+    await message.answer("⏳ Обрабатываю видео и накладываю вотермарку...")
     
     input_video_path = f"input_{message.from_user.id}.mp4"
     output_video_path = f"output_{message.from_user.id}.mp4"
-    preview_img_path = f"preview_{message.from_user.id}.jpg"
     
     file = await bot.get_file(file_id)
     await bot.download_file(file.file_path, input_video_path)
@@ -189,6 +167,7 @@ async def process_link(message: types.Message, state: FSMContext):
     success = apply_watermark(input_video_path, output_video_path)
     final_video_path = output_video_path if success else input_video_path
     
+    # Загружаем видео в Telegram и вытаскиваем идеальный file_id из облака
     temp_msg = await bot.send_video(chat_id=message.from_user.id, video=types.FSInputFile(final_video_path))
     new_file_id = temp_msg.video.file_id
     await bot.delete_message(chat_id=message.from_user.id, message_id=temp_msg.message_id)
@@ -196,30 +175,31 @@ async def process_link(message: types.Message, state: FSMContext):
     video_slug = generate_random_slug()
     video_database[video_slug] = new_file_id
     
-    download_random_image(preview_img_path)
-    
     bot_user = await bot.get_me()
     caption = f"┃ {title} ❞\n\n"
     if video_link.lower() != "нет":
         caption += f"ссылка на видео\n👇👇👇👇👇👇\n\n{video_link}\n\n"
     caption += f"<a href='https://t.me{bot_user.username}?start=buy'>приват</a>"
     
+    # Ссылка на запуск бота теперь на 100% валидна для Telegram
     channel_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎬 Смотреть видео", url=f"https://t.me{bot_user.username}?start=vid_{video_slug}")]
     ])
     
-    await bot.send_photo(
-        chat_id=message.from_user.id, photo=types.FSInputFile(preview_img_path),
-        caption=f"👀 <b>ПРЕДПРОСМОТР ПОСТА:</b>\n\n{caption}", reply_markup=channel_kb, parse_mode="HTML"
+    # Показываем текстовый предпросмотр админу
+    await message.answer(
+        text=f"👀 <b>ПРЕДПРОСМОТР ПОСТА ДЛЯ КАНАЛА:</b>\n\n{caption}", 
+        reply_markup=channel_kb, 
+        parse_mode="HTML"
     )
     
-    await state.update_data(caption=caption, video_slug=video_slug, preview_path=preview_img_path)
+    await state.update_data(caption=caption, video_slug=video_slug)
     
     confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Опубликовать", callback_data="publish_post")],
+        [InlineKeyboardButton(text="🚀 Опубликовать текст с кнопкой", callback_data="publish_post")],
         [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_post")]
     ])
-    await message.answer("Публикуем эту заглушку в канал?", reply_markup=confirm_kb)
+    await message.answer("Публикуем пост с инлайн-кнопкой в канал?", reply_markup=confirm_kb)
     await state.set_state(PostStates.waiting_for_confirm)
     
     if os.path.exists(input_video_path): os.remove(input_video_path)
@@ -236,22 +216,22 @@ async def publish_post(callback: types.CallbackQuery, state: FSMContext):
     ])
     
     try:
-        await bot.send_photo(
-            chat_id=channel_id, photo=types.FSInputFile(data['preview_path']),
-            caption=data['caption'], reply_markup=channel_kb, parse_mode="HTML"
+        # Отправляем чистый форматированный текст со ссылками и рабочей кнопкой
+        await bot.send_message(
+            chat_id=channel_id, 
+            text=data['caption'], 
+            reply_markup=channel_kb, 
+            parse_mode="HTML"
         )
-        await callback.message.answer("🚀 Пост-заглушка успешно отправлен в канал!")
+        await callback.message.answer("🚀 Пост успешно опубликован в канал!")
     except Exception as e:
         await callback.message.answer(f"❌ Ошибка публикации: {e}")
         
-    if os.path.exists(data['preview_path']): os.remove(data['preview_path'])
     await state.clear()
     await callback.answer()
 
 @dp.callback_query(PostStates.waiting_for_confirm, F.data == "cancel_post")
 async def cancel_post(callback: types.CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    if os.path.exists(data['preview_path']): os.remove(data['preview_path'])
     await state.clear()
     await callback.message.answer("❌ Публикация отменена.")
     await callback.answer()
