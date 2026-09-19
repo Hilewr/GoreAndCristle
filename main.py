@@ -1,8 +1,12 @@
 import os
+import json
+import time
 import html
 import asyncio
 import random
 import string
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, StateFilter
@@ -23,19 +27,25 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана")
 
-ADMIN_IDS = [8053962845]  # Твой админский ID
+ADMIN_IDS = [8053962845, 8519289540, 6612202387]  # Админы бота
 PRICE_STARS = 150        # Цена в Звездах (150 Stars)
 PRICE_LINK = "https://t.me/hebesm"  # Твой Прайс/Директ
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Базы данных в оперативной памяти бота
-video_database = {}
-CHANNEL_DATA = {"id": None}  # Хранение ID канала без создания файлов
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+WATERMARK_PATH = os.path.join(BASE_DIR, "watermark.png")
 
 PRIVATE_LIMIT = 2  # сколько приватов продаётся вместе
 BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # больше этого бот не может скачать через Bot API
+
+# --- ХРАНИЛИЩЕ ---
+# Каналы, приваты, ссылки на видео, пул автопостов и счётчик лежат в JSON-файле и переживают перезапуск.
+# Файл создаётся рядом с main.py. Если хостинг стирает диск при перезапуске/деплое, подключи постоянный том
+# и укажи путь к нему в переменной окружения DATA_DIR.
+DATA_DIR = os.getenv("DATA_DIR", BASE_DIR)
+DATA_FILE = os.path.join(DATA_DIR, "bot_data.json")
 
 
 def parse_ids(raw):
@@ -47,13 +57,55 @@ def parse_ids(raw):
     return ids
 
 
-# ID привязанных приватов. Заполняются командой /private_links.
-# Чтобы привязка переживала перезапуск бота, можно задать их на хостинге переменной:
-# PRIVATE_CHANNEL_IDS="-1001111111111,-1002222222222"
-PRIVATE_CHANNELS = parse_ids(os.getenv("PRIVATE_CHANNEL_IDS"))[:PRIVATE_LIMIT]
+def load_state():
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать {DATA_FILE}: {e}")
+        return {}
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-WATERMARK_PATH = os.path.join(BASE_DIR, "watermark.png")
+
+_stored = load_state()
+STATE_LOADED = bool(_stored)
+
+# slug -> file_id видео для кнопок «Смотреть видео»
+video_database = dict(_stored.get("videos", {}))
+
+# Основной канал для постов. Можно задать заранее переменной CHANNEL_ID.
+_env_channel = os.getenv("CHANNEL_ID", "")
+CHANNEL_DATA = {"id": int(_env_channel) if _env_channel.lstrip("-").isdigit() else _stored.get("channel_id")}
+
+# ID привязанных приватов. Заполняются командами /private_links и /private_here.
+# Можно задать заранее переменной: PRIVATE_CHANNEL_IDS="-1001111111111,-1002222222222"
+PRIVATE_CHANNELS = (parse_ids(os.getenv("PRIVATE_CHANNEL_IDS")) or list(_stored.get("private_channels", [])))[:PRIVATE_LIMIT]
+
+# Автопосты: пул видео из привата, счётчик номера, дата последнего поста
+AUTOPOST = {"enabled": True, "source_id": None, "counter": 0, "last_date": None, "pool": [], "used": []}
+AUTOPOST.update(_stored.get("autopost", {}))
+_env_source = os.getenv("AUTOPOST_SOURCE_ID", "")
+if _env_source.lstrip("-").isdigit():
+    AUTOPOST["source_id"] = int(_env_source)
+
+
+def save_state():
+    data = {
+        "channel_id": CHANNEL_DATA["id"],
+        "private_channels": PRIVATE_CHANNELS,
+        "videos": video_database,
+        "autopost": AUTOPOST,
+    }
+    tmp_path = DATA_FILE + ".tmp"
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp_path, DATA_FILE)  # атомарно: файл не повредится, даже если бот упадёт посреди записи
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить {DATA_FILE}: {e}")
+
 
 _BOT_USERNAME = None
 
@@ -86,6 +138,10 @@ async def notify_admins(text):
 # Только маленькие латинские буквы и цифры (заглавные запрещены в параметре ?start=)
 def generate_random_slug(length=12):
     return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+
+class AutopostStates(StatesGroup):
+    importing = State()
 
 
 class PrivateStates(StatesGroup):
@@ -158,6 +214,72 @@ def apply_watermark_image(input_path, output_path):
         return False
 
 
+_COVER_FILE_ID = None
+
+
+async def get_cover_file_id(chat_id):
+    """Картинка для постов без своей картинки: сама вотермарка.
+    Загружаем один раз (через личку админа, сообщение сразу удаляем) и кэшируем file_id."""
+    global _COVER_FILE_ID
+    if _COVER_FILE_ID:
+        return _COVER_FILE_ID
+    if not os.path.exists(WATERMARK_PATH):
+        return None
+    try:
+        temp = await bot.send_photo(chat_id=chat_id, photo=types.FSInputFile(WATERMARK_PATH))
+        _COVER_FILE_ID = temp.photo[-1].file_id
+        await bot.delete_message(chat_id=chat_id, message_id=temp.message_id)
+    except Exception as e:
+        print(f"Не удалось подготовить картинку-вотермарку: {e}")
+        return None
+    return _COVER_FILE_ID
+
+
+async def prepare_video(file_id, upload_chat_id, tag, size=None):
+    """Скачивает видео, накладывает вотермарку и загружает обратно в Telegram.
+    Возвращает (file_id для выдачи, предупреждение или None).
+    Файлы больше 20 МБ бот скачать не может, поэтому они уходят как есть, по оригинальному file_id."""
+    input_path = f"input_{tag}.mp4"
+    output_path = f"output_{tag}.mp4"
+    too_big = "ℹ️ Видео больше 20 МБ: оно уйдёт без вотермарки."
+    try:
+        if size and size > BOT_API_DOWNLOAD_LIMIT:
+            return file_id, too_big
+        try:
+            video_file = await bot.get_file(file_id)
+        except TelegramBadRequest as e:
+            if "too big" not in str(e).lower():
+                raise
+            return file_id, too_big
+        await bot.download_file(video_file.file_path, input_path)
+
+        # moviepy работает синхронно и долго, поэтому гоняем в отдельном потоке,
+        # чтобы бот не «замерзал» для остальных пользователей
+        success = await asyncio.to_thread(apply_watermark, input_path, output_path)
+        final_path = output_path if success else input_path
+        warning = None if success else "⚠️ Вотермарка на видео не наложилась (подробности в логах): оно уйдёт без неё."
+
+        # Загружаем видео в Telegram и вытаскиваем нормальный file_id из облака
+        temp_msg = await bot.send_video(chat_id=upload_chat_id, video=types.FSInputFile(final_path))
+        new_file_id = temp_msg.video.file_id
+        await bot.delete_message(chat_id=upload_chat_id, message_id=temp_msg.message_id)
+        return new_file_id, warning
+    finally:
+        # Временные файлы чистим в любом случае, даже если что-то упало
+        for path in (input_path, output_path):
+            if os.path.exists(path):
+                os.remove(path)
+
+
+def build_caption(title, video_link, bot_username):
+    # Текст идёт с parse_mode=HTML, поэтому экранируем спецсимволы (<, >, &)
+    caption = f"┃ {html.escape(title)} ❞\n\n"
+    if video_link and video_link.lower() != "нет":
+        caption += f"ссылка на видео\n👇👇👇👇👇👇\n\n{html.escape(video_link)}\n\n"
+    caption += f"<a href='{make_bot_link(bot_username, 'buy')}'>приват</a>"
+    return caption
+
+
 # --- ПРИВЯЗКА ПРИВАТОВ: /private_links ---
 # Эти хендлеры должны стоять ВЫШЕ привязки основного канала: пока админ в режиме
 # привязки приватов, пересланный пост должен попасть сюда, а не в основной канал.
@@ -195,6 +317,7 @@ async def start_private_binding(message: types.Message, state: FSMContext):
 
 async def commit_private_channels(message: types.Message, state: FSMContext, ids, note=""):
     PRIVATE_CHANNELS[:] = ids
+    save_state()
     await state.clear()
     ids_str = ",".join(str(i) for i in ids)
     await message.answer(
@@ -299,6 +422,7 @@ async def bind_private_here(message: types.Message):
         return
 
     PRIVATE_CHANNELS.append(chat.id)
+    save_state()
     ids_str = ",".join(str(i) for i in PRIVATE_CHANNELS)
     await message.answer(
         f"✅ Приват «{chat.title}» привязан ({len(PRIVATE_CHANNELS)}/{PRIVATE_LIMIT}).\n\n"
@@ -307,12 +431,299 @@ async def bind_private_here(message: types.Message):
     )
 
 
+# --- АВТОПОСТЫ: контент из привата (группы с темами) ---
+# Бот копит видео из группы в «пул» (новые сообщения он видит сам, старые можно переслать ему командой
+# /autopost import), а раз в день в случайное время выкладывает в канал одно случайное видео из пула
+# с подписью «Приват контент #N». Картинка поста — вотермарка. Кнопка «Смотреть видео» работает как в обычных постах.
+AUTOPOST_TZ_NAME = os.getenv("AUTOPOST_TZ", "Europe/Moscow")
+try:
+    AUTOPOST_TZ = ZoneInfo(AUTOPOST_TZ_NAME)
+except Exception:
+    print(f"⚠️ Часовой пояс «{AUTOPOST_TZ_NAME}» не найден, использую UTC")
+    AUTOPOST_TZ, AUTOPOST_TZ_NAME = timezone.utc, "UTC"
+
+
+def _parse_window(raw):
+    try:
+        start, end = (int(x) for x in (raw or "11-21").split("-"))
+        if 0 <= start < end <= 24:
+            return start, end
+    except ValueError:
+        pass
+    return 11, 21
+
+
+AUTOPOST_WINDOW = _parse_window(os.getenv("AUTOPOST_WINDOW"))  # часы, в которые может выйти пост, например "11-21"
+AUTOPOST_LOCK = asyncio.Lock()  # чтобы ручной запуск и расписание не пересеклись
+IMPORT_STATS = {"added": 0, "dups": 0}
+_SCHED = {"fail_date": None, "fails": 0, "next_retry": 0.0}
+
+
+def autopost_now():
+    return datetime.now(AUTOPOST_TZ)
+
+
+def planned_time(day):
+    """Случайное время автопоста на указанный день. Оно одинаково при перезапусках бота."""
+    start_h, end_h = AUTOPOST_WINDOW
+    minute = random.Random(f"autopost-{day.isoformat()}").randrange(start_h * 60, end_h * 60)
+    return datetime(day.year, day.month, day.day, minute // 60, minute % 60, tzinfo=AUTOPOST_TZ)
+
+
+def add_to_pool(video):
+    """Добавляет видео в пул. False, если оно там уже есть."""
+    uid = video.file_unique_id
+    if any(item["uid"] == uid for item in AUTOPOST["pool"]):
+        return False
+    AUTOPOST["pool"].append({"fid": video.file_id, "uid": uid, "size": video.file_size})
+    save_state()
+    return True
+
+
+def pick_item(exclude):
+    """Случайное видео, которое ещё не выходило в этом круге. Когда все вышли, начинается новый круг."""
+    used = set(AUTOPOST["used"])
+    candidates = [i for i in AUTOPOST["pool"] if i["uid"] not in exclude]
+    fresh = [i for i in candidates if i["uid"] not in used]
+    restarted = False
+    if not fresh and candidates:
+        AUTOPOST["used"] = []
+        fresh = candidates
+        restarted = True
+    return (random.choice(fresh) if fresh else None), restarted
+
+
+async def publish_autopost():
+    """Публикует один автопост в основной канал. Возвращает (успех, текст для админа)."""
+    async with AUTOPOST_LOCK:
+        channel_id = get_channel_id()
+        if not channel_id:
+            return False, "Основной канал не привязан: перешли мне в личку любой пост из него."
+        if not AUTOPOST["pool"]:
+            return False, "В пуле нет видео. Напиши /autopost source в группе-привате и/или /autopost import мне в личку."
+
+        bot_username = await get_bot_username()
+        upload_chat = ADMIN_IDS[0]
+        tried, last_error = set(), None
+
+        for _ in range(5):
+            item, restarted = pick_item(tried)
+            if item is None:
+                break
+            tried.add(item["uid"])
+            number = AUTOPOST["counter"] + 1
+
+            # 1) готовим видео; если это видео не открылось (удалено и т.п.), пробуем другое
+            try:
+                new_file_id, warning = await prepare_video(item["fid"], upload_chat, "autopost", item.get("size"))
+            except Exception as e:
+                last_error = str(e)
+                print(f"Автопост: не удалось подготовить видео {item['uid']}: {e}")
+                continue
+
+            # 2) публикуем; если не вышло здесь, дело не в видео, и другие пробовать бессмысленно
+            slug = generate_random_slug()
+            video_database[slug] = new_file_id  # запись должна быть до поста: кнопку могут нажать сразу
+            caption = build_caption(f"Приват контент #{number}", None, bot_username)
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🎬 Смотреть видео", url=make_bot_link(bot_username, f"vid_{slug}"))]
+            ])
+            try:
+                cover_id = await get_cover_file_id(upload_chat)
+                if cover_id:
+                    await bot.send_photo(chat_id=channel_id, photo=cover_id, caption=caption, reply_markup=kb, parse_mode="HTML")
+                else:
+                    await bot.send_message(chat_id=channel_id, text=caption, reply_markup=kb, parse_mode="HTML")
+            except Exception as e:
+                video_database.pop(slug, None)
+                return False, f"Не удалось опубликовать пост в канал: {e}"
+
+            AUTOPOST["counter"] = number
+            AUTOPOST["used"].append(item["uid"])
+            AUTOPOST["last_date"] = autopost_now().date().isoformat()
+            save_state()
+
+            info = f"✅ Опубликовано: «Приват контент #{number}»."
+            if warning:
+                info += f"\n{warning}"
+            if restarted:
+                info += "\n🔁 Все видео из пула уже выходили, начался новый круг."
+            return True, info
+
+        return False, f"Не удалось подготовить видео: {last_error or 'в пуле нет подходящих'}"
+
+
+async def autopost_tick():
+    """Одна проверка расписания (вызывается раз в минуту)."""
+    now = autopost_now()
+    today = now.date().isoformat()
+
+    if AUTOPOST["last_date"] is None:
+        # Самый первый запуск: чтобы бот не выложил пост «с порога», расписание стартует с завтрашнего дня.
+        AUTOPOST["last_date"] = today
+        save_state()
+        return
+    if not AUTOPOST["enabled"] or AUTOPOST["last_date"] == today:
+        return
+    if not AUTOPOST["pool"] or not get_channel_id():
+        return  # ещё не настроено, ждём молча
+    if now < planned_time(now.date()):
+        return
+    if _SCHED["fail_date"] == today and (_SCHED["fails"] >= 3 or time.time() < _SCHED["next_retry"]):
+        return
+
+    ok, info = await publish_autopost()
+    if ok:
+        _SCHED["fails"] = 0
+        return
+    if _SCHED["fail_date"] != today:
+        _SCHED["fail_date"], _SCHED["fails"] = today, 0
+    _SCHED["fails"] += 1
+    _SCHED["next_retry"] = time.time() + 600  # повтор через 10 минут, максимум 3 попытки в день
+    await notify_admins(f"⚠️ Автопост не удался (попытка {_SCHED['fails']}/3): {info}")
+
+
+async def autopost_scheduler():
+    while True:
+        try:
+            await autopost_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"Ошибка планировщика автопостов: {e}")
+        await asyncio.sleep(60)
+
+
+def is_source_video(message: types.Message) -> bool:
+    return bool(message.video) and AUTOPOST["source_id"] is not None and message.chat.id == AUTOPOST["source_id"]
+
+
+@dp.message(is_source_video)
+async def collect_source_video(message: types.Message):
+    add_to_pool(message.video)
+
+
+@dp.message(Command("autopost"))
+async def autopost_cmd(message: types.Message, command: CommandObject, state: FSMContext):
+    user, chat = message.from_user, message.chat
+    if user and user.id == GROUP_ANONYMOUS_BOT_ID:
+        await message.answer("Ты пишешь анонимно (от имени группы), и я не вижу, кто ты. Отключи анонимность у админа и повтори.")
+        return
+    if not user or user.id not in ADMIN_IDS:
+        return
+
+    parts = (command.args or "").split()
+    action = parts[0].lower() if parts else "now"
+
+    if action == "now":
+        await message.answer("⏳ Готовлю автопост (вотермарка может занять время)...")
+        ok, info = await publish_autopost()
+        await message.answer(info)
+
+    elif action == "status":
+        pool = AUTOPOST["pool"]
+        used = set(AUTOPOST["used"])
+        fresh = sum(1 for i in pool if i["uid"] not in used)
+        today = autopost_now().date()
+        posted_today = AUTOPOST["last_date"] in (None, today.isoformat())
+        next_dt = planned_time(today + timedelta(days=1) if posted_today else today)
+        source = AUTOPOST["source_id"] or "не задан (напиши /autopost source в группе-привате)"
+        await message.answer(
+            f"Автопост: {'включён' if AUTOPOST['enabled'] else 'выключен'}\n"
+            f"Источник контента: {source}\n"
+            f"Видео в пуле: {len(pool)} (ещё не выходили в этом круге: {fresh})\n"
+            f"Следующий номер: #{AUTOPOST['counter'] + 1}\n"
+            f"Последний автопост: {AUTOPOST['last_date'] or 'ещё не было'}\n"
+            f"Ближайший по расписанию: {next_dt:%d.%m %H:%M} "
+            f"({AUTOPOST_TZ_NAME}, окно {AUTOPOST_WINDOW[0]}:00–{AUTOPOST_WINDOW[1]}:00)\n"
+            f"Файл данных: {DATA_FILE}"
+        )
+
+    elif action in ("on", "off"):
+        AUTOPOST["enabled"] = action == "on"
+        save_state()
+        await message.answer("✅ Автопост включён." if AUTOPOST["enabled"] else "⏸ Автопост выключен (ручной /autopost продолжит работать).")
+
+    elif action == "number":
+        if len(parts) < 2 or not parts[1].isdigit() or int(parts[1]) < 1:
+            await message.answer("Напиши номер, с которого продолжить, например: /autopost number 57")
+            return
+        AUTOPOST["counter"] = int(parts[1]) - 1
+        save_state()
+        await message.answer(f"✅ Следующий автопост будет «Приват контент #{parts[1]}».")
+
+    elif action == "source":
+        if chat.type not in ("group", "supergroup"):
+            await message.answer("Эту команду надо писать прямо в группе-привате, откуда брать контент.")
+            return
+        try:
+            member = await bot.get_chat_member(chat_id=chat.id, user_id=bot.id)
+            is_admin = member.status == "administrator"
+        except Exception:
+            is_admin = False
+        if not is_admin:
+            await message.answer("Сделай бота админом этой группы, иначе он не видит сообщения, и повтори команду.")
+            return
+        AUTOPOST["source_id"] = chat.id
+        save_state()
+        await message.answer(
+            "✅ Эта группа теперь источник контента для автопостов. Новые видео попадут в пул сами.\n"
+            "Старые видео: напиши мне в личку /autopost import и перешли их."
+        )
+
+    elif action == "import":
+        if chat.type != "private":
+            await message.answer("Эту команду надо писать мне в личку.")
+            return
+        IMPORT_STATS["added"] = IMPORT_STATS["dups"] = 0
+        await state.set_state(AutopostStates.importing)
+        await message.answer(
+            "Пересылай мне видео из группы-привата: можно выделить много сообщений и переслать пачкой. "
+            "Я молчу, пока не напишешь /done (или /cancel, уже добавленное останется)."
+        )
+
+    else:
+        await message.answer(
+            "Команды автопоста:\n"
+            "/autopost: выложить пост прямо сейчас (проверка или если долго не было постов)\n"
+            "/autopost status: состояние и расписание\n"
+            "/autopost on, /autopost off: включить или выключить расписание\n"
+            "/autopost number N: следующий пост будет #N\n"
+            "/autopost source: (в группе-привате) брать контент отсюда\n"
+            "/autopost import: (в личке) добавить в пул старые видео пересылкой"
+        )
+
+
+@dp.message(AutopostStates.importing, F.video)
+async def import_video(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS: return
+    if add_to_pool(message.video):
+        IMPORT_STATS["added"] += 1
+    else:
+        IMPORT_STATS["dups"] += 1
+
+
+@dp.message(AutopostStates.importing, Command("done"))
+async def import_done(message: types.Message, state: FSMContext):
+    if message.from_user.id not in ADMIN_IDS: return
+    await state.clear()
+    await message.answer(
+        f"✅ Готово. Добавлено новых: {IMPORT_STATS['added']}, уже были: {IMPORT_STATS['dups']}. "
+        f"Всего в пуле: {len(AUTOPOST['pool'])}."
+    )
+
+
+@dp.message(AutopostStates.importing, lambda m: not m.video and not (m.text or "").startswith("/"))
+async def import_hint(message: types.Message):
+    await message.answer("Пересылай мне видео или напиши /done, /cancel.")
+
+
 # --- ПРИВЯЗКА КАНАЛА ---
 # Работает только когда админ НЕ в процессе создания поста (StateFilter(None)):
 # внутри /post пересланные видео и картинки из других каналов — это материал для поста,
 # а не привязка. Плюс канал привязывается, только если бот там админ с правом публикации,
 # поэтому случайная пересылка из чужого канала ничего не перепривяжет.
-@dp.message(StateFilter(None), F.forward_from_chat)
+@dp.message(StateFilter(None), F.chat.type == "private", F.forward_from_chat)
 async def handle_forwarded_channel(message: types.Message):
     if message.from_user.id not in ADMIN_IDS: return
     chat = message.forward_from_chat
@@ -331,6 +742,7 @@ async def handle_forwarded_channel(message: types.Message):
         return
 
     CHANNEL_DATA["id"] = chat.id
+    save_state()
     await message.answer(f"✅ Канал «{chat.title}» привязан для постов.\nID канала: {chat.id}\nТеперь можно создавать посты.")
 
 
@@ -428,12 +840,12 @@ async def start_post(message: types.Message, state: FSMContext):
 
 @dp.message(PostStates.waiting_for_video, F.video)
 async def process_video(message: types.Message, state: FSMContext):
-    await state.update_data(file_id=message.video.file_id)
+    await state.update_data(file_id=message.video.file_id, video_size=message.video.file_size)
     text = "Видео получено."
     size = message.video.file_size
     if size and size > BOT_API_DOWNLOAD_LIMIT:
         text += f"\nℹ️ Оно весит {size / 1024 / 1024:.0f} МБ (больше 20 МБ), поэтому уйдёт без вотермарки."
-    text += "\n\nТеперь отправь картинку для поста (или напиши «нет», если пост без картинки):"
+    text += "\n\nТеперь отправь картинку для поста (или напиши «нет», тогда картинкой будет вотермарка):"
     await message.answer(text)
     await state.set_state(PostStates.waiting_for_photo)
 
@@ -451,7 +863,7 @@ async def process_photo_skip(message: types.Message, state: FSMContext):
         await message.answer("Отправь картинку или напиши «нет»:")
         return
     await state.update_data(photo_file_id=None)
-    await message.answer("Ок, без картинки. Напиши имя автора / описание (например: «влад сопляков»):")
+    await message.answer("Ок, картинкой будет вотермарка. Напиши имя автора / описание (например: «влад сопляков»):")
     await state.set_state(PostStates.waiting_for_title)
 
 
@@ -480,43 +892,18 @@ async def process_link(message: types.Message, state: FSMContext):
     await message.answer("⏳ Обрабатываю видео и накладываю вотермарку...")
 
     user_id = message.from_user.id
-    input_video_path = f"input_{user_id}.mp4"
-    output_video_path = f"output_{user_id}.mp4"
     input_photo_path = f"input_{user_id}.jpg"
     output_photo_path = f"output_{user_id}.jpg"
     new_photo_id = None
     warnings = []
 
     try:
-        video_file = None
-        try:
-            video_file = await bot.get_file(file_id)
-        except TelegramBadRequest as e:
-            if "too big" not in str(e).lower():
-                raise
+        new_file_id, warning = await prepare_video(file_id, user_id, str(user_id), data.get('video_size'))
+        if warning:
+            warnings.append(warning)
 
-        if video_file is None:
-            # Больше 20 МБ: скачать нельзя, значит вотермарку не наложить.
-            # Отдаём видео по оригинальному file_id (по file_id отправка работает при любом размере).
-            new_file_id = file_id
-            warnings.append("ℹ️ Видео больше 20 МБ: оно уйдёт без вотермарки.")
-        else:
-            await bot.download_file(video_file.file_path, input_video_path)
-
-            # moviepy работает синхронно и долго, поэтому гоняем в отдельном потоке,
-            # чтобы бот не «замерзал» для остальных пользователей
-            success = await asyncio.to_thread(apply_watermark, input_video_path, output_video_path)
-            final_video_path = output_video_path if success else input_video_path
-            if not success:
-                warnings.append("⚠️ Вотермарка на видео не наложилась (подробности в логах): оно уйдёт без неё.")
-
-            # Загружаем видео в Telegram и вытаскиваем нормальный file_id из облака
-            temp_msg = await bot.send_video(chat_id=user_id, video=types.FSInputFile(final_video_path))
-            new_file_id = temp_msg.video.file_id
-            await bot.delete_message(chat_id=user_id, message_id=temp_msg.message_id)
-
-        # Картинка для поста: та же вотермарка + тот же приём с file_id
         if photo_file_id:
+            # Своя картинка: та же вотермарка + тот же приём с file_id
             photo_file = await bot.get_file(photo_file_id)
             await bot.download_file(photo_file.file_path, input_photo_path)
             photo_ok = await asyncio.to_thread(apply_watermark_image, input_photo_path, output_photo_path)
@@ -527,26 +914,24 @@ async def process_link(message: types.Message, state: FSMContext):
             temp_photo = await bot.send_photo(chat_id=user_id, photo=types.FSInputFile(final_photo_path))
             new_photo_id = temp_photo.photo[-1].file_id
             await bot.delete_message(chat_id=user_id, message_id=temp_photo.message_id)
+        else:
+            # Картинки нет («нет»): картинкой поста становится сама вотермарка
+            new_photo_id = await get_cover_file_id(user_id)
     except Exception as e:
         await message.answer(f"❌ Не удалось обработать видео: {e}")
         await state.clear()
         return
     finally:
-        # Временные файлы чистим в любом случае, даже если что-то упало
-        for path in (input_video_path, output_video_path, input_photo_path, output_photo_path):
+        for path in (input_photo_path, output_photo_path):
             if os.path.exists(path):
                 os.remove(path)
 
     video_slug = generate_random_slug()
     video_database[video_slug] = new_file_id
+    save_state()
 
     bot_username = await get_bot_username()
-
-    # Текст идёт с parse_mode=HTML, поэтому экранируем спецсимволы (<, >, &)
-    caption = f"┃ {html.escape(title)} ❞\n\n"
-    if video_link.lower() != "нет":
-        caption += f"ссылка на видео\n👇👇👇👇👇👇\n\n{html.escape(video_link)}\n\n"
-    caption += f"<a href='{make_bot_link(bot_username, 'buy')}'>приват</a>"
+    caption = build_caption(title, video_link, bot_username)
 
     channel_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎬 Смотреть видео", url=make_bot_link(bot_username, f"vid_{video_slug}"))]
@@ -624,7 +1009,23 @@ async def cancel_post(callback: types.CallbackQuery, state: FSMContext):
 
 
 async def main():
-    await dp.start_polling(bot)
+    scheduler = asyncio.create_task(autopost_scheduler())
+    try:
+        # Сообщение о запуске: сразу видно, сохранились ли данные после перезапуска
+        note = "" if STATE_LOADED else (
+            "\n\n⚠️ Сохранённых данных нет. Это нормально при первом запуске. Если запуск не первый, "
+            "значит хостинг стирает диск: подключи постоянный том и укажи его в DATA_DIR."
+        )
+        await notify_admins(
+            "🔄 Бот запущен.\n"
+            f"Основной канал: {'привязан' if get_channel_id() else 'не привязан'}\n"
+            f"Приваты: {len(PRIVATE_CHANNELS)} из {PRIVATE_LIMIT}\n"
+            f"Видео в пуле автопостов: {len(AUTOPOST['pool'])}, автопост {'включён' if AUTOPOST['enabled'] else 'выключен'}"
+            + note
+        )
+        await dp.start_polling(bot)
+    finally:
+        scheduler.cancel()
 
 
 if __name__ == "__main__":
