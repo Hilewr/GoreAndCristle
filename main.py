@@ -39,7 +39,7 @@ class PostStates(StatesGroup):
     waiting_for_link = State()
     waiting_for_confirm = State()
 
-# --- НАЛОЖЕНИЕ ВОТЕРМАРКИ ---
+# --- УЛЬТРА-БЫСТРОЕ НАЛОЖЕНИЕ ВОТЕРМАРКИ ---
 def apply_watermark(input_path, output_path):
     if not os.path.exists(WATERMARK_PATH):
         print(f"⚠️ Вотермарка не найдена по пути: {WATERMARK_PATH}")
@@ -52,7 +52,17 @@ def apply_watermark(input_path, output_path):
                      .set_duration(video.duration)
                      .set_position(("right", "bottom")))
         final_video = CompositeVideoClip([video, watermark])
-        final_video.write_videofile(output_path, codec="libx264", audio_codec="aac", logger=None)
+        
+        # Оптимизированный ультра-быстрый рендеринг (для экономии CPU хостинга)
+        final_video.write_videofile(
+            output_path, 
+            codec="libx264", 
+            audio_codec="aac", 
+            logger=None,
+            threads=4,
+            preset="ultrafast"
+        )
+        
         video.close()
         final_video.close()
         return True
@@ -95,7 +105,7 @@ async def start_cmd(message: types.Message, command: CommandObject):
         video_slug = args.replace("vid_", "")
         if video_slug in video_database:
             saved_file_id = video_database[video_slug]
-            await message.answer("🎬 Твое video готово к просмотру:")
+            await message.answer("🎬 Твое видео готово к просмотру:")
             await bot.send_video(chat_id=message.from_user.id, video=saved_file_id)
             return
         else:
