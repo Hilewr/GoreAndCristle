@@ -1,13 +1,11 @@
 import os
 import asyncio
-from io import BytesIO
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import CommandStart
+from aiogram.utils.payload import decode_payload, encode_payload
 from dotenv import load_dotenv
 
-# Загружаем переменные из .env (если файл существует рядом с кодом)
 load_dotenv()
-
-# Получаем токен из переменной окружения
 TOKEN = os.getenv("BOT_TOKEN")
 
 if not TOKEN:
@@ -17,26 +15,47 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 
+# 1. Принимаем видео и генерируем ссылку
 @dp.message(F.video)
 async def video_handler(message: types.Message):
-    await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_video")
-
-    video_buffer = BytesIO()
-
-    # Скачиваем в оперативную память
-    video_file = await message.bot.get_file(message.video.file_id)
-    await message.bot.download_file(video_file.file_path, video_buffer)
-    video_buffer.seek(0)
-
-    # Отправляем обратно из памяти
-    await message.answer_video(
-        video=types.BufferedInputFile(video_buffer.read(), filename="video.mp4"),
-        caption="Ваше видео через переходник 🔄"
+    # Получаем file_id видео
+    file_id = message.video.file_id
+    
+    # Кодируем file_id для ссылки (Telegram не любит сырые file_id в параметрах start)
+    payload = encode_payload(file_id)
+    
+    # Получаем имя бота, чтобы собрать ссылку
+    bot_info = await bot.get_me()
+    link = f"https://t.me{bot_info.username}?start={payload}"
+    
+    await message.reply(
+        f"🔗 **Ссылка на просмотр видео:**\n`{link}`\n\n"
+        f"Поделитесь ей, и при переходе пользователь сразу получит этот ролик.",
+        parse_mode="Markdown"
     )
 
 
+# 2. Обрабатываем переход по ссылке (команда /start с параметром)
+@dp.message(CommandStart())
+async def start_command(message: types.Message):
+    # Достаем то, что идет после /start
+    args = message.text.split(maxsplit=1)
+    
+    if len(args) > 1:
+        try:
+            # Декодируем оригинальный file_id видео
+            file_id = decode_payload(args[1])
+            
+            # Отправляем видео пользователю (мгновенно, без скачивания на сервер!)
+            await message.answer_video(video=file_id, caption="Ваше видео 🍿")
+        except Exception:
+            await message.answer("❌ Неверная или устаревшая ссылка.")
+    else:
+        await message.answer("Привет! Отправь мне видео, а я сделаю на него ссылку для просмотра.")
+
+
 async def main():
-    print("Бот запущен...")
+    print("Бот-переходник запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
