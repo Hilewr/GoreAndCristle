@@ -1,81 +1,99 @@
-import os
 import asyncio
-from aiogram import Bot, Dispatcher, types, F
+import json
+import logging
+import os
+import uuid
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, CommandObject
-from aiogram.utils.payload import decode_payload, encode_payload
-from dotenv import load_dotenv
+from aiogram.types import Message
 
-# Инициализируем переменные окружения
-load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
+# ---------------------------------------------------------------------------
+# Настройки
+# ---------------------------------------------------------------------------
 
-if not TOKEN:
-    exit("Ошибка: Переменная окружения BOT_TOKEN не задана!")
+BOT_TOKEN = os.environ["BOT_TOKEN"]  # токен берётся из переменной окружения
 
-bot = Bot(token=TOKEN)
+DB_FILE = Path(__file__).parent / "links.json"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-
-# 1. Принимаем видео и генерируем одну железную tg:// ссылку
-@dp.message(F.video)
-async def video_handler(message: types.Message):
-    file_id = message.video.file_id
-    
-    # Безопасно кодируем file_id для передачи внутри ссылки
-    payload = encode_payload(file_id)
-    
-    # Получаем актуальный юзернейм вашего бота
-    bot_info = await bot.get_me()
-    username = bot_info.username
-    
-    # Создаем прямую внутреннюю ссылку
-    tg_link = f"tg://resolve?domain={username}&start={payload}"
-    
-    text = (
-        f"🔗 **Ссылка на видео готова!**\n\n"
-        f"Скопируйте и перешлите её в любой чат:\n\n"
-        f"`{tg_link}`"
-    )
-    
-    # Инлайн-кнопка для моментального просмотра прямо из бота для тестов
-    keyboard = types.InlineKeyboardMarkup(
-        inline_keyboard=[
-            [types.InlineKeyboardButton(text="Смотреть видео 🍿", url=tg_link)]
-        ]
-    )
-    
-    await message.reply(text, reply_markup=keyboard, parse_mode="Markdown")
+_lock = asyncio.Lock()
 
 
-# 2. ИСПРАВЛЕНО: Правильный перехват аргумента по клику на ссылку
+# ---------------------------------------------------------------------------
+# Простое хранилище "код -> file_id" (JSON-файл, без скачивания видео)
+# ---------------------------------------------------------------------------
+
+def _load() -> dict:
+    if DB_FILE.exists():
+        return json.loads(DB_FILE.read_text(encoding="utf-8"))
+    return {}
+
+
+def _save(data: dict) -> None:
+    DB_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+async def save_link(code: str, file_id: str) -> None:
+    async with _lock:
+        data = _load()
+        data[code] = file_id
+        _save(data)
+
+
+async def get_file_id(code: str) -> str | None:
+    async with _lock:
+        data = _load()
+        return data.get(code)
+
+
+# ---------------------------------------------------------------------------
+# Хендлеры
+# ---------------------------------------------------------------------------
+
+@dp.message(CommandStart(deep_link=True))
+async def start_with_code(message: Message, command: CommandObject):
+    code = command.args
+    file_id = await get_file_id(code)
+    if not file_id:
+        await message.answer("Ссылка недействительна или устарела.")
+        return
+    await message.answer_video(file_id)
+
+
 @dp.message(CommandStart())
-async def start_command(message: types.Message, command: CommandObject):
-    # Достаем аргумент (payload) напрямую через инструмент aiogram
-    args = command.args
-    
-    if args:
-        try:
-            # Декодируем оригинальный file_id видео
-            file_id = decode_payload(args)
-            
-            # Telegram мгновенно отправляет его из своего облака пользователю
-            await message.answer_video(video=file_id, caption="Ваше видео 🍿")
-        except Exception as e:
-            # Если токен ссылки битый или старый
-            await message.answer("❌ Ссылка повреждена или устарела.")
-            print(f"Ошибка декодирования: {e}")
-    else:
-        # Если пользователь просто зашел в бота и нажал Старт без ссылки
-        await message.answer(
-            "Привет! Я бот-переходник.\n\n"
-            "Отправь мне любое видео, а я сделаю на него прямую "
-            "ссылку, по которой его сможет посмотреть любой пользователь."
-        )
+async def start_plain(message: Message):
+    await message.answer(
+        "Привет! Пришли мне видео — я верну ссылку, по которой его можно получить снова."
+    )
 
+
+@dp.message(F.video)
+async def handle_video(message: Message):
+    file_id = message.video.file_id
+    code = uuid.uuid4().hex[:10]
+    await save_link(code, file_id)
+
+    bot_info = await bot.get_me()
+    link = f"https://t.me/{bot_info.username}?start={code}"
+    await message.answer(f"Готово! Ссылка на видео:\n{link}")
+
+
+# ---------------------------------------------------------------------------
+# Точка входа
+# ---------------------------------------------------------------------------
 
 async def main():
-    print("Бот-переходник успешно запущен!")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
