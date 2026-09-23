@@ -5,6 +5,7 @@ from aiogram.filters import CommandStart
 from aiogram.utils.payload import decode_payload, encode_payload
 from dotenv import load_dotenv
 
+# Загружаем переменные окружения
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 
@@ -15,47 +16,65 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 
-# 1. Принимаем видео и генерируем ссылку
+# 1. Принимаем видео и выдаем ОДНУ железно рабочую ссылку
 @dp.message(F.video)
 async def video_handler(message: types.Message):
-    # Получаем file_id видео
     file_id = message.video.file_id
     
-    # Кодируем file_id для ссылки (Telegram не любит сырые file_id в параметрах start)
+    # Кодируем file_id, чтобы Telegram пропустил его через параметр start
     payload = encode_payload(file_id)
     
-    # Получаем имя бота, чтобы собрать ссылку
+    # Получаем юзернейм бота
     bot_info = await bot.get_me()
-    link = f"https://t.me{bot_info.username}?start={payload}"
+    username = bot_info.username
     
-    await message.reply(
-        f"🔗 **Ссылка на просмотр видео:**\n`{link}`\n\n"
-        f"Поделитесь ей, и при переходе пользователь сразу получит этот ролик.",
-        parse_mode="Markdown"
+    # Создаем прямую ссылку, которая открывается строго внутри приложения Telegram
+    tg_link = f"tg://resolve?domain={username}&start={payload}"
+    
+    # Отрендерим красивый текст с кнопкой для удобства
+    text = (
+        f"🔗 **Ссылка на видео готова!**\n\n"
+        f"Скопируйте её и отправьте кому угодно. При клике человек сразу откроет бота и получит это видео:\n\n"
+        f"`{tg_link}`"
     )
+    
+    # Добавим инлайн-кнопку для еще более быстрого перехода
+    keyboard = types.InlineKeyboardMarkup(
+        inline_keyboard=[
+            [types.InlineKeyboardButton(text="Смотреть видео 🍿", url=tg_link)]
+        ]
+    )
+    
+    await message.reply(text, reply_markup=keyboard, parse_mode="Markdown")
 
 
-# 2. Обрабатываем переход по ссылке (команда /start с параметром)
+# 2. Обрабатываем клик по этой ссылке (команда /start с параметром)
 @dp.message(CommandStart())
 async def start_command(message: types.Message):
-    # Достаем то, что идет после /start
+    # Пытаемся достать аргумент из команды /start (все, что идет после start=)
     args = message.text.split(maxsplit=1)
     
     if len(args) > 1:
+        raw_payload = args[1]
         try:
-            # Декодируем оригинальный file_id видео
-            file_id = decode_payload(args[1])
+            # Декодируем обратно оригинальный file_id видео
+            file_id = decode_payload(raw_payload)
             
-            # Отправляем видео пользователю (мгновенно, без скачивания на сервер!)
-            await message.answer_video(video=file_id, caption="Ваше видео 🍿")
+            # Отправляем видео из облака Telegram (0% нагрузки на твой сервер)
+            await message.answer_video(video=file_id, caption="Ваше видео через переходник 🔄")
         except Exception:
-            await message.answer("❌ Неверная или устаревшая ссылка.")
+            await message.answer("❌ Неверная, поврежденная или устаревшая ссылка.")
     else:
-        await message.answer("Привет! Отправь мне видео, а я сделаю на него ссылку для просмотра.")
+        # Обычный старт без параметров
+        await message.answer(
+            "Привет! Я бот-переходник.\n\n"
+            "Просто отправь мне любое видео, а я сделаю на него прямую "
+            "ссылку, по которой его сможет посмотреть любой пользователь."
+        )
 
 
 async def main():
-    print("Бот-переходник запущен...")
+    print("Бот-переходник запущен и готов к работе...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
