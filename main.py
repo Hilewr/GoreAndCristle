@@ -7,6 +7,7 @@ import random
 import string
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, StateFilter
@@ -30,6 +31,13 @@ if not BOT_TOKEN:
 BASE_ADMIN_IDS = [8899823176, 8519289540, 6612202387]  # Админы, заданные в коде. Их нельзя снять командой /removeadmin
 
 PRICE_LINK = "https://t.me/hebesm"  # Твой Прайс/Директ
+
+# Реклама RichAds (richads.com/ru/publishers) — необязательные переменные.
+# Если RICHADS_PUBLISHER_ID не задан, реклама просто не показывается и бот работает как раньше.
+RICHADS_PUBLISHER_ID = os.getenv("RICHADS_PUBLISHER_ID")
+RICHADS_WIDGET_ID = os.getenv("RICHADS_WIDGET_ID")
+RICHADS_BID_FLOOR = float(os.getenv("RICHADS_BID_FLOOR", "0.0001"))
+RICHADS_URL = "http://15068.xml.adx1.com/telegram-mb"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -825,6 +833,71 @@ async def handle_forwarded_channel(message: types.Message):
     await message.answer(f"✅ Канал «{chat.title}» привязан для постов.\nID канала: {chat.id}\nТеперь можно создавать посты.")
 
 
+# --- РЕКЛАМА RICHADS ---
+async def fetch_ad(user_id, lang="ru"):
+    """Запрашивает рекламный креатив у RichAds. Возвращает None, если
+    реклама не настроена или запрос не удался — тогда видео просто уходит без рекламы."""
+    if not RICHADS_PUBLISHER_ID:
+        return None
+
+    payload = {
+        "language_code": lang,
+        "publisher_id": RICHADS_PUBLISHER_ID,
+        "telegram_id": str(user_id),
+        "bid_floor": RICHADS_BID_FLOOR,
+        "production": True,
+    }
+    if RICHADS_WIDGET_ID:
+        payload["widget_id"] = RICHADS_WIDGET_ID
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(RICHADS_URL, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                if isinstance(data, list) and data:
+                    return data[0]
+                return None
+    except Exception as e:
+        print(f"⚠️ Не удалось получить рекламу RichAds: {e}")
+        return None
+
+
+async def notify_impression(url):
+    """Сообщает RichAds, что объявление реально показано пользователю."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            await session.get(url, timeout=aiohttp.ClientTimeout(total=5))
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить notification_url в RichAds: {e}")
+
+
+async def show_ad(user_id, lang="ru"):
+    ad = await fetch_ad(user_id, lang)
+    if not ad:
+        return
+
+    caption = ad.get("message") or ad.get("title") or "Спонсор"
+    button_text = ad.get("button") or "Открыть"
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=button_text, url=ad["link"])]]
+    )
+    try:
+        if ad.get("image"):
+            await bot.send_photo(
+                chat_id=user_id, photo=ad["image"], caption=caption,
+                reply_markup=keyboard, protect_content=True,
+            )
+        else:
+            await bot.send_message(chat_id=user_id, text=caption, reply_markup=keyboard, protect_content=True)
+
+        if ad.get("notification_url"):
+            asyncio.create_task(notify_impression(ad["notification_url"]))
+    except Exception as e:
+        print(f"⚠️ Не удалось показать рекламу RichAds: {e}")
+
+
 # --- СТАРТ И ВЫДАЧА ВИДЕО В ЛИЧКУ ---
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, command: CommandObject):
@@ -835,6 +908,8 @@ async def start_cmd(message: types.Message, command: CommandObject):
         video_slug = args[len("vid_"):]
         if video_slug in video_database:
             saved_file_id = video_database[video_slug]
+            lang = message.from_user.language_code or "ru"
+            await show_ad(message.from_user.id, lang)
             await message.answer("🎬 Твое видео готово к просмотру:")
             await bot.send_video(chat_id=message.from_user.id, video=saved_file_id)
             return
