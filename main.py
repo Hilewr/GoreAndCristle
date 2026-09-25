@@ -962,6 +962,99 @@ async def backup_cmd(message: types.Message):
     )
 
 
+# --- УПРАВЛЕНИЕ АДМИНАМИ: /addadmin, /removeadmin, /admins ---
+async def resolve_user(raw):
+    """По @username или ID находит user_id и username. Сначала пробует спросить у Telegram напрямую
+    (работает без переписки с ботом, если username публичный), иначе ищет среди тех, кто уже писал боту."""
+    arg = raw.strip().lstrip("@")
+    if not arg:
+        return None, None
+
+    if arg.isdigit():
+        uid = int(arg)
+        return uid, USERS.get(str(uid), {}).get("username")
+
+    try:
+        chat = await bot.get_chat(f"@{arg}")
+        if chat.type == "private":
+            return chat.id, chat.username
+    except Exception:
+        pass
+
+    low = arg.lower()
+    for uid, info in USERS.items():
+        if (info.get("username") or "").lower() == low:
+            return int(uid), info.get("username")
+    return None, None
+
+
+@dp.message(Command("addadmin"))
+async def addadmin_cmd(message: types.Message, command: CommandObject):
+    if not message.from_user or message.from_user.id not in ADMIN_IDS: return
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer("Напиши username или ID: /addadmin @gerasim или /addadmin 123456789")
+        return
+
+    user_id, username = await resolve_user(arg)
+    if user_id is None:
+        await message.answer(
+            f"Не нашёл «{arg}». Если это публичный username, проверь, что он написан без опечаток. "
+            "Если нет — пусть человек сначала напишет боту /start, потом попробуй снова."
+        )
+        return
+    if user_id in ADMIN_IDS:
+        await message.answer(f"{who_is(user_id, username)} уже админ.")
+        return
+
+    ADMIN_IDS.append(user_id)
+    EXTRA_ADMINS[str(user_id)] = {"username": username, "added_by": message.from_user.id, "added_at": time.time()}
+    save_state()
+
+    who = who_is(user_id, username)
+    await message.answer(f"✅ {who} теперь админ бота.")
+    try:
+        await bot.send_message(chat_id=user_id, text="✅ Тебя добавили в админы бота.")
+    except Exception:
+        pass  # человек ещё не писал боту — сам увидит права при следующей команде
+    await notify_admins(f"👤 Новый админ: {who}. Добавил: {who_is(message.from_user.id, message.from_user.username)}")
+
+
+@dp.message(Command("removeadmin"))
+async def removeadmin_cmd(message: types.Message, command: CommandObject):
+    if not message.from_user or message.from_user.id not in ADMIN_IDS: return
+    arg = (command.args or "").strip()
+    if not arg:
+        await message.answer("Напиши username или ID: /removeadmin @gerasim или /removeadmin 123456789")
+        return
+
+    user_id, username = await resolve_user(arg)
+    if user_id is None or str(user_id) not in EXTRA_ADMINS:
+        if user_id in BASE_ADMIN_IDS:
+            await message.answer("Этого админа нельзя снять командой: он задан в коде бота (в BASE_ADMIN_IDS).")
+        else:
+            await message.answer(f"«{arg}» не найден среди админов, добавленных командой /addadmin.")
+        return
+
+    username = username or EXTRA_ADMINS[str(user_id)].get("username")
+    ADMIN_IDS.remove(user_id)
+    del EXTRA_ADMINS[str(user_id)]
+    save_state()
+    await message.answer(f"✅ {who_is(user_id, username)} больше не админ.")
+    await notify_admins(f"👤 Снят админ: {who_is(user_id, username)}. Снял: {who_is(message.from_user.id, message.from_user.username)}")
+
+
+@dp.message(Command("admins"))
+async def admins_cmd(message: types.Message):
+    if not message.from_user or message.from_user.id not in ADMIN_IDS: return
+    lines = ["Админы бота:"]
+    for uid in BASE_ADMIN_IDS:
+        lines.append(f"• {who_is(uid, USERS.get(str(uid), {}).get('username'))} (из кода)")
+    for uid_str, info in EXTRA_ADMINS.items():
+        lines.append(f"• {who_is(int(uid_str), info.get('username'))} (добавлен командой)")
+    await message.answer("\n".join(lines))
+
+
 # --- АДМИНКА: СОЗДАНИЕ ПОСТА ---
 @dp.message(Command("post"))
 async def start_post(message: types.Message, state: FSMContext):
