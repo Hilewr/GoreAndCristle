@@ -27,7 +27,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("Переменная окружения BOT_TOKEN не задана")
 
-BASE_ADMIN_IDS = [8053962845, 8519289540, 6612202387]  # Админы, заданные в коде. Их нельзя снять командой /removeadmin
+BASE_ADMIN_IDS = [8899823176, 8519289540, 6612202387]  # Админы, заданные в коде. Их нельзя снять командой /removeadmin
 
 PRICE_LINK = "https://t.me/hebesm"  # Твой Прайс/Директ
 
